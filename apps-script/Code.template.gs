@@ -9,18 +9,20 @@
  *   1. 구글 시트 → 확장 프로그램 → Apps Script → 이 파일 전체를 붙여 넣기
  *   2. 왼쪽 톱니바퀴(프로젝트 설정) → 스크립트 속성 → 속성 추가
  *        속성: TEACHER_PASSWORD   값: 10자 이상의 교사 비밀번호
+ *        (선택) TEACHER_PASSWORD2  값: 보조 비밀번호. 학생이 일부러 틀려 교사 화면이 막혔을 때도 들어갈 수 있다
  *      (비밀번호를 코드에 쓰지 않으므로 이 파일은 공개 저장소에 두어도 안전하다)
  *   3. 함수 목록에서 setup 실행 → 배포 → 새 배포 → 웹 앱(실행: 나, 액세스: 모든 사용자)
  *   코드를 바꾼 뒤에는 배포 → 배포 관리 → 수정 → 버전: 새 버전 → 배포 (주소는 그대로)
  */
 
 const SHEET_DATA = '보고서';     // 학생 한 명이 한 줄
-const SHEET_ROSTER = '명단';     // 학번·이름을 적어 두면 명단에 있는 학생만 들어올 수 있습니다
+const SHEET_ROSTER = '명단';     // A 학번, B 이름, C 생년월일(월일 4자리, 선택). 적어 두면 명단에 있는 학생만 들어오고, C열이 있으면 처음 비밀번호가 생년월일이 된다
 const MAX_LEN = 3000;            // 한 칸에 저장하는 최대 글자 수
 const MAX_FAILS = 10;            // 학생 비밀번호를 이만큼 연속으로 틀리면 잠깐 잠긴다
-const LOCK_MINUTES = 15;         // 학생 잠금 시간(지나면 저절로 풀리고, 교사가 초기화해도 풀린다)
+const LOCK_MINUTES = 5;          // 학생 잠금 시간(지나면 저절로 풀리고, 교사가 초기화해도 풀린다)
 const MAX_STUDENTS = 300;        // 명단 없이 운영할 때 등록할 수 있는 최대 학생 수(장난 등록 막기)
-const TEACHER_MAX_FAILS = 8;     // 교사 비밀번호를 10분 안에 이만큼 틀리면 10분 동안 교사 화면을 막는다
+const TEACHER_MAX_FAILS = 8;     // 교사 비밀번호를 10분 안에 이만큼 틀리면 10분 동안 막는다(보조 비밀번호 TEACHER_PASSWORD2 는 막는 중에도 들어갈 수 있다)
+const LIST_ALL_MAX = 120;        // 학생이 이보다 많으면 교사 화면은 반 단위로 불러온다
 const MIN_TEACHER_PW = 10;       // 교사 비밀번호 최소 길이
 const BACKUP_PREFIX = '백업 ';   // 초기화·백업 때 만드는 시트 이름 앞부분
 const HEADER_ROWS = 2;           // 1행: 내부 이름, 2행: 한글 설명
@@ -40,10 +42,11 @@ function setup() {
   let roster = ss.getSheetByName(SHEET_ROSTER);
   if (!roster) {
     roster = ss.insertSheet(SHEET_ROSTER);
-    roster.getRange(1, 1, 1, 2).setValues([['학번', '이름']]);
+    roster.getRange(1, 1, 1, 3).setValues([['학번', '이름', '생년월일(월일 4자리, 처음 비밀번호)']]);
     roster.setFrozenRows(1);
   }
-  roster.getRange(1, 1, roster.getMaxRows(), 2).setNumberFormat('@');
+  if (String(roster.getRange(1, 3).getValues()[0][0]) === '') roster.getRange(1, 3).setValues([['생년월일(월일 4자리, 처음 비밀번호)']]);
+  roster.getRange(1, 1, roster.getMaxRows(), 3).setNumberFormat('@');
 }
 
 /* ------------------------------------------------------------ 웹 앱 입구 */
@@ -76,6 +79,7 @@ function doPost(e) {
 function handle_(req) {
   switch (req.action) {
     case 'login': return login_(req);
+    case 'change_pin': return changePin_(req);
     case 'save': return save_(req);
     case 'teacher_list': return teacherList_(req);
     case 'teacher_save': return teacherSave_(req);
@@ -92,18 +96,44 @@ function login_(req) {
   const d = getData_();
   let row = findRow_(d, who.id);
   if (!row) {
-    checkRoster_(who.id, who.name);
+    const birth = checkRoster_(who.id, who.name);
+    checkBirth_(birth, who);
     if (d.sh.getLastRow() - HEADER_ROWS >= MAX_STUDENTS) fail_('등록할 수 있는 학생 수를 넘었습니다. 선생님께 알려 주세요.');
     const rec = {};
-    rec.id = who.id; rec.name = who.name; rec.pin = hash_(who.id, who.pin);
+    rec.id = who.id; rec.name = who.name; rec.pin = hash_(who.id, birth || who.pin);
     rec.fails = '0'; rec.created = now_();
     row = appendRecord_(d, rec);
-    return { ok: true, isNew: true, data: studentView_(readRecord_(d, row)) };
+    return { ok: true, isNew: true, initial: !!birth, data: studentView_(readRecord_(d, row)) };
   }
   const rec = readRecord_(d, row);
   if (norm_(rec.name) !== norm_(who.name)) fail_('이 학번은 다른 이름으로 등록되어 있습니다. 학번을 확인하세요.');
+  let birth = '';
+  if (rec.pin === '') {                       // 교사가 초기화한 학생: 생년월일이 있으면 생년월일로만 다시 등록
+    birth = rosterBirth_(who.id);
+    checkBirth_(birth, who);
+    if (birth) who.pin = birth;
+  }
   checkPin_(d, row, rec, who);
-  return { ok: true, data: studentView_(readRecord_(d, row)) };
+  const b2 = birth || rosterBirth_(who.id);
+  const initial = !!b2 && readRecord_(d, row).pin === hash_(who.id, b2);
+  return { ok: true, initial: initial, data: studentView_(readRecord_(d, row)) };
+}
+
+/* 학생이 스스로 비밀번호를 바꾼다(처음 비밀번호인 생년월일은 친구가 알 수 있으므로) */
+function changePin_(req) {
+  const who = checkWho_(req);
+  const np = String(req.newpin == null ? '' : req.newpin);
+  if (np.length < 4 || np.length > 12) fail_('새 비밀번호는 4~12자로 정하세요.');
+  const d = getData_();
+  const row = findRow_(d, who.id);
+  if (!row) fail_('먼저 로그인하세요.');
+  const rec = readRecord_(d, row);
+  if (norm_(rec.name) !== norm_(who.name)) fail_('이 학번은 다른 이름으로 등록되어 있습니다.');
+  checkPin_(d, row, rec, who);
+  const birth = rosterBirth_(who.id);
+  if (birth && birthOf_(np) === birth) fail_('생년월일과 다른 비밀번호로 정하세요.');
+  writeRecord_(d, row, { pin: hash_(who.id, np), fails: '0', lockt: '' });
+  return { ok: true };
 }
 
 function save_(req) {
@@ -136,10 +166,32 @@ function teacherList_(req) {
   const d = getData_();
   const last = d.sh.getLastRow();
   const rows = [];
+  const classes = {};
+  const cls = /^\d{1,3}$/.test(String(req.cls || '')) ? String(req.cls) : '';
+  let total = 0;
+  if (last > HEADER_ROWS) {
+    // 학번 열만 먼저 읽어 반별 인원을 센다(반 고르기 목록에 씀)
+    d.sh.getRange(HEADER_ROWS + 1, 1, last - HEADER_ROWS, 1).getValues().forEach(function (v) {
+      const id = String(v[0]).trim();
+      if (!id) return;
+      total++;
+      const c = id.slice(0, -2);
+      classes[c] = (classes[c] || 0) + 1;
+    });
+  }
+  const roster = (function () {
+    const r = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_ROSTER);
+    return r ? Math.max(0, r.getLastRow() - 1) : 0;
+  })();
+  const meta = { classes: classes, total: total, roster: roster, maxFails: MAX_FAILS, lockMinutes: LOCK_MINUTES, now: Date.now() };
+  // 학생이 많으면 반을 고를 때까지 목록을 보내지 않는다
+  const partial = !cls && !req.all && total > LIST_ALL_MAX;
+  if (partial) return Object.assign({ ok: true, rows: [], partial: true }, meta);
   if (last > HEADER_ROWS) {
     const vals = d.sh.getRange(HEADER_ROWS + 1, 1, last - HEADER_ROWS, d.keys.length).getValues();
     vals.forEach(function (v) {
       if (String(v[0]) === '') return;
+      if (cls && String(v[0]).trim().slice(0, -2) !== cls) return;
       const o = {};
       d.keys.forEach(function (k, i) { if (k) o[k] = String(v[i] == null ? '' : v[i]); });
       o.hasPin = o.pin !== '';
@@ -148,7 +200,7 @@ function teacherList_(req) {
     });
   }
   rows.sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
-  return { ok: true, rows: rows };
+  return Object.assign({ ok: true, rows: rows, cls: cls }, meta);
 }
 
 function teacherSave_(req) {
@@ -181,7 +233,7 @@ function checkWho_(req) {
   const pin = String(req.pin == null ? '' : req.pin);
   if (!/^\d{4,5}$/.test(id)) fail_('학번은 숫자 4~5자리로 입력하세요.');
   if (name.length < 1 || name.length > 10) fail_('이름을 확인하세요.');
-  if (pin.length < 4 || pin.length > 12) fail_('비밀번호는 4~12자로 정하세요.');
+  if (pin.length < 3 || pin.length > 12) fail_('비밀번호는 4~12자로 정하세요.');   // 3자는 0을 뺀 생년월일(310)만 통과한다
   return { id: id, name: name, pin: pin };
 }
 
@@ -197,7 +249,8 @@ function checkPin_(d, row, rec, who) {
     if (left > 0) fail_('비밀번호를 여러 번 틀려 ' + left + '분 동안 잠겼습니다. 기다리거나 선생님께 초기화를 요청하세요.');
     fails = 0;                                // 잠금 시간이 지나면 다시 시도할 수 있다
   }
-  if (rec.pin !== hash_(who.id, who.pin)) {
+  const bp = birthOf_(who.pin);              // 생년월일 비밀번호는 310 처럼 0을 빼고 써도 맞게 본다
+  if (rec.pin !== hash_(who.id, who.pin) && !(bp && rec.pin === hash_(who.id, bp))) {
     fails += 1;
     writeRecord_(d, row, { fails: String(fails), lockt: fails >= MAX_FAILS ? String(Date.now()) : rec.lockt || '' });
     fail_(fails >= MAX_FAILS ? '비밀번호를 여러 번 틀려 ' + LOCK_MINUTES + '분 동안 잠겼습니다.' : '비밀번호가 다릅니다. 잊었으면 선생님께 초기화를 요청하세요.');
@@ -205,12 +258,36 @@ function checkPin_(d, row, rec, who) {
   if (Number(rec.fails) > 0) writeRecord_(d, row, { fails: '0', lockt: '' });
 }
 
+/* 명단 확인. 명단에 있으면 그 학생의 생년월일(월일 4자리, 없으면 '')을 돌려준다 */
 function checkRoster_(id, name) {
+  const vals = rosterRows_();
+  if (!vals) return '';                       // 명단이 비어 있으면 누구나 등록
+  const hit = vals.filter(function (v) { return String(v[0]).trim() === id && norm_(v[1]) === norm_(name); })[0];
+  if (!hit) fail_('명단에 없는 학번 또는 이름입니다. 다시 확인하세요.');
+  return birthOf_(hit[2]);
+}
+function rosterRows_() {
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_ROSTER);
-  if (!sh || sh.getLastRow() < 2) return;      // 명단이 비어 있으면 누구나 등록
-  const vals = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
-  const ok = vals.some(function (v) { return String(v[0]).trim() === id && norm_(v[1]) === norm_(name); });
-  if (!ok) fail_('명단에 없는 학번 또는 이름입니다. 다시 확인하세요.');
+  if (!sh || sh.getLastRow() < 2) return null;
+  return sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues();
+}
+function rosterBirth_(id) {
+  const vals = rosterRows_();
+  if (!vals) return '';
+  const hit = vals.filter(function (v) { return String(v[0]).trim() === id; })[0];
+  return hit ? birthOf_(hit[2]) : '';
+}
+/* 생년월일을 월일 4자리로 맞춘다. 310 → 0310, 1225 → 1225, 080310·20080310 → 0310 (숫자가 아니면 '') */
+function birthOf_(v) {
+  if (v instanceof Date) return ('0' + (v.getMonth() + 1)).slice(-2) + ('0' + v.getDate()).slice(-2);
+  let s = String(v == null ? '' : v).replace(/[^0-9]/g, '');
+  if (s.length === 6 || s.length === 8) s = s.slice(-4);
+  if (s.length === 3) s = '0' + s;
+  return /^(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])$/.test(s) ? s : '';
+}
+function checkBirth_(birth, who) {
+  if (birth && birthOf_(who.pin) !== birth) fail_('처음 비밀번호는 생년월일 4자리(월일)예요. 예: 3월 10일 → 0310');
+  if (!birth && who.pin.length < 4) fail_('비밀번호는 4~12자로 정하세요.');
 }
 
 function teacherPassword_() {
@@ -222,14 +299,19 @@ function checkTeacher_(req) {
   if (pw.length < MIN_TEACHER_PW) {
     fail_('Apps Script 프로젝트 설정의 스크립트 속성에 TEACHER_PASSWORD(' + MIN_TEACHER_PW + '자 이상)를 넣어 주세요.');
   }
+  const given = String(req.tpw == null ? '' : req.tpw);
   const cache = CacheService.getScriptCache();
   const tries = Number(cache.get('tfail') || 0);
-  if (tries >= TEACHER_MAX_FAILS) fail_('교사 비밀번호를 여러 번 틀려 10분 동안 막았습니다. 잠시 뒤 다시 시도하세요.');
-  if (!same_(String(req.tpw == null ? '' : req.tpw), pw)) {
+  // 보조 비밀번호는 막는 중에도 통과한다(누군가 일부러 틀려 교사 화면을 막는 장난 대비)
+  const pw2 = String(PropertiesService.getScriptProperties().getProperty('TEACHER_PASSWORD2') || '');
+  if (pw2.length >= MIN_TEACHER_PW && same_(given, pw2)) { if (tries) cache.remove('tfail'); return; }
+  if (tries >= TEACHER_MAX_FAILS) fail_('교사 비밀번호를 여러 번 틀려 10분 동안 막았습니다. 보조 비밀번호(TEACHER_PASSWORD2)가 있으면 그것으로 들어오세요.');
+  if (!same_(given, pw)) {
     cache.put('tfail', String(tries + 1), 600);
     Utilities.sleep(800);
     fail_('교사 비밀번호가 다릅니다.');
   }
+  if (tries) cache.remove('tfail');           // 맞게 들어오면 틀린 횟수를 지운다
 }
 
 // 글자를 끝까지 비교해 맞힌 글자 수로 시간이 달라지지 않게 한다

@@ -59,14 +59,16 @@ function store(key, val) {
 
 /* ---------- 서버 통신 ---------- */
 const DEMO = !API_URL;
+/* 다시 보내면 되는 오류(인터넷 끊김, 서버 응답 없음)는 net 표시를 붙인다 */
+function netErr(m) { const e = new Error(m); e.net = true; return e; }
 async function api(req) {
   if (DEMO) return demoApi(req);
   let res;
   try {
     res = await fetch(API_URL, { method: "POST", body: JSON.stringify(req), redirect: "follow" });
-  } catch (e) { throw new Error("서버에 연결하지 못했습니다. 인터넷 연결을 확인하고 다시 시도하세요."); }
+  } catch (e) { throw netErr("서버에 연결하지 못했습니다. 인터넷 연결을 확인하고 다시 시도하세요."); }
   let out;
-  try { out = await res.json(); } catch (e) { throw new Error("서버 응답을 읽지 못했습니다. 잠시 뒤 다시 시도하세요."); }
+  try { out = await res.json(); } catch (e) { throw netErr("서버 응답을 읽지 못했습니다. 잠시 뒤 다시 시도하세요."); }
   if (!out.ok) throw new Error(out.error || "처리하지 못했습니다.");
   return out;
 }
@@ -79,6 +81,13 @@ function demoApi(req) {
   const fail = function (m) { throw new Error(m); };
   const pub = function (r) { const o = {}; for (const k in r) if (k !== "pin" && k !== "t_memo" && k !== "t_note" && !/^t_r/.test(k)) o[k] = r[k]; return o; };
   let out;
+  if (req.action === "change_pin") {
+    const r = db.rows[req.id];
+    if (!r || r.pin !== req.pin) fail("비밀번호가 다릅니다.");
+    if (String(req.newpin).length < 4) fail("새 비밀번호는 4~12자로 정하세요.");
+    r.pin = req.newpin; store("eco_demo", db);
+    return Promise.resolve({ ok: true });
+  }
   if (req.action === "login" || req.action === "save") {
     let r = db.rows[req.id];
     if (!r) {
@@ -94,7 +103,13 @@ function demoApi(req) {
     } else out = { ok: true, data: pub(r) };
   } else {
     if (req.tpw !== "demo") fail("교사 비밀번호가 다릅니다. (미리보기 모드에서는 demo)");
-    if (req.action === "teacher_list") out = { ok: true, rows: Object.keys(db.rows).sort().map(function (k) { const o = Object.assign({}, db.rows[k]); o.hasPin = !!o.pin; delete o.pin; return o; }) };
+    if (req.action === "teacher_list") {
+      const classes = {};
+      Object.keys(db.rows).forEach(function (k) { const c = k.slice(0, -2); classes[c] = (classes[c] || 0) + 1; });
+      out = { ok: true, classes: classes, total: Object.keys(db.rows).length, roster: -1, maxFails: 10, lockMinutes: 5, now: Date.now(),
+        rows: Object.keys(db.rows).sort().filter(function (k) { return !req.cls || k.slice(0, -2) === req.cls; })
+          .map(function (k) { const o = Object.assign({}, db.rows[k]); o.hasPin = !!o.pin; delete o.pin; return o; }) };
+    }
     else if (req.action === "teacher_save") { for (const k in req.data) if (/^t_/.test(k)) db.rows[req.id][k] = String(req.data[k]); out = { ok: true }; }
     else if (req.action === "teacher_reset") { db.rows[req.id].pin = ""; out = { ok: true }; }
     else if (req.action === "teacher_backup" || req.action === "teacher_clear") {
@@ -139,6 +154,20 @@ function startBrowse() {
   S.browse = true; S.id = ""; S.name = ""; S.pin = ""; S.data = {}; S.cur = "s1"; S.dirty = false;
   renderStudent(); window.scrollTo(0, 0);
 }
+/* 비밀번호 바꾸기: 처음 비밀번호(생년월일)는 친구가 알 수 있으므로 바꾸기를 권한다 */
+async function changePin() {
+  const a = prompt("새 비밀번호를 정해 주세요 (4~12자, 생년월일은 안 돼요)");
+  if (a == null) return;
+  if (a.length < 4 || a.length > 12) return toast("새 비밀번호는 4~12자로 정하세요.", true);
+  const b = prompt("확인을 위해 새 비밀번호를 한 번 더 써 주세요");
+  if (b == null) return;
+  if (a !== b) return toast("두 번 쓴 비밀번호가 달라요. 다시 해 주세요.", true);
+  try {
+    await api({ action: "change_pin", id: S.id, name: S.name, pin: S.pin, newpin: a });
+    S.pin = a; S.initial = false; renderStudent();
+    toast("🔑 비밀번호를 바꿨어요. 다음부터는 새 비밀번호로 들어와요.");
+  } catch (e) { toast(e.message, true); }
+}
 function goHome() { leaveStudent(); window.scrollTo(0, 0); }
 function goLogin() {
   leaveStudent();
@@ -148,6 +177,8 @@ function goLogin() {
 function leaveStudent() {
   /* 공용 컴퓨터를 생각해 이 기기에 남은 임시 저장과 화면의 글을 지운다 */
   if (S.id) store("eco_draft_" + S.id, null);
+  clearTimeout(S.autoT); clearTimeout(S.retryT);
+  if (S.id && pendGet()) toast("📶 아직 못 보낸 내용은 이 기기에 보관했다가, 다음에 로그인하면 보내요.");
   S.browse = false; S.id = S.name = S.pin = ""; S.data = {}; S.dirty = false;
   renderLogin();
 }
@@ -168,25 +199,30 @@ function renderLogin() {
     const v = { id: id.value.trim(), name: name.value.trim(), pin: pin.value };
     if (!/^\d{4,5}$/.test(v.id)) return toast("학번은 숫자 4~5자리로 입력하세요.", true);
     if (!v.name) return toast("이름을 입력하세요.", true);
-    if (v.pin.length < 4) return toast("비밀번호는 4자 이상으로 정하세요.", true);
+    if (v.pin.length < 3) return toast("비밀번호를 확인하세요. 생년월일이면 0310처럼 4자리로 써요.", true);
     go.disabled = true; go.textContent = "확인하는 중…";
     try {
       const out = await api({ action: "login", id: v.id, name: v.name, pin: v.pin });
-      S.id = v.id; S.name = v.name; S.pin = v.pin; S.data = out.data || {};
+      S.id = v.id; S.name = v.name; S.pin = v.pin; S.data = out.data || {}; S.initial = !!out.initial;
       let draft = store("eco_draft_" + S.id);
       if (draft && !(draft.at > Date.now() - 3 * 86400000)) { store("eco_draft_" + S.id, null); draft = null; }   // 3일 지난 임시 저장은 버린다
       S.browse = false;
       if (draft && draft.data) { Object.assign(S.data, draft.data); S.dirty = true; S.cur = draft.cur || "s1"; }
       else { const next = STAGES.find(function (st) { return stageStatus(S.data, st) < 2; }); S.cur = next ? next.id : STAGES[STAGES.length - 1].id; }
+      const pend = pendGet();
+      if (pend) Object.keys(pend).forEach(function (k) { if (/^s\d$/.test(k)) Object.assign(S.data, pend[k]); });
       renderStudent(); window.scrollTo(0, 0);
-      if (draft && draft.data) toast("저장하지 않은 내용을 불러왔습니다. 저장하기를 눌러 주세요.");
+      if (S.initial) setTimeout(function () { toast("🔑 처음 비밀번호(생년월일)는 친구도 알 수 있어요. 위의 '비밀번호 바꾸기'로 나만 아는 비밀번호로 바꿔 두세요."); }, 2500);
+      if (pend) flushPending();
+      else if (draft && draft.data) toast("저장하지 않은 내용을 불러왔습니다. 1분 뒤 자동으로 저장되고, 💾를 눌러 바로 저장해도 돼요.");
+      if (draft && draft.data) scheduleAuto();
     } catch (e) { toast(e.message, true); go.disabled = false; go.textContent = "출발하기 🚀"; }
   } },
     h("h2", { text: "👋 시작해 볼까요?" }),
     h("label", { class: "fl", for: "lid", text: "학번" }), id,
     h("label", { class: "fl", for: "lname", text: "이름" }), name,
     h("label", { class: "fl", for: "lpin", text: "비밀번호" }),
-    h("p", { class: "hint", text: "처음이면 내가 쓸 비밀번호를 정해서 넣어요(4자 이상). 다음부터는 같은 비밀번호로 들어와요. 다른 사이트에서 쓰는 비밀번호는 쓰지 마세요." }), pin,
+    h("p", { class: "hint", text: "처음 비밀번호는 생년월일 4자리(월일)예요. 예: 3월 10일 → 0310. 들어온 뒤 '🔑 비밀번호 바꾸기'로 나만 아는 비밀번호로 바꿀 수 있어요. 선생님이 생년월일을 정해 두지 않았다면 처음 들어올 때 내가 쓸 비밀번호(4자 이상)를 정해요." }), pin,
     h("div", { style: "margin-top:20px" }, go),
     h("button", { class: "btn ghost", type: "button", style: "width:100%; margin-top:8px", text: "👀 먼저 둘러볼래요 (저장 안 됨)", onclick: startBrowse }),
     h("p", { class: "hint", style: "margin:12px 0 0", text: "비밀번호를 잊었으면 선생님께 초기화를 부탁하세요. 쓰던 내용은 지워지지 않아요." }));
@@ -311,8 +347,44 @@ function markDirty() {
   S.dirty = true;
   store("eco_draft_" + S.id, { cur: S.cur, data: stageData(S.cur), at: Date.now() });
   const st = document.getElementById("savestate");
-  if (st) { st.textContent = "✋ 저장 안 됨"; st.className = "state dirty"; }
+  if (st) { st.textContent = "✋ 저장 안 됨 · 1분 뒤 자동 저장"; st.className = "state dirty"; }
+  scheduleAuto();
 }
+/* 자동 저장: 마지막으로 고친 뒤 1분 동안 손을 멈추면 저장한다 */
+const AUTO_MS = 60000;
+function scheduleAuto() {
+  clearTimeout(S.autoT);
+  if (S.browse || !S.id) return;
+  S.autoT = setTimeout(function () {
+    if (!S.dirty || S.browse || !S.id) return;
+    if (S.busy) return scheduleAuto();
+    saveStage("auto");
+  }, AUTO_MS);
+}
+/* 보관함: 인터넷이 끊겨 못 보낸 단계 내용을 이 기기에 두었다가 연결되면 다시 보낸다 */
+function pendKey() { return "eco_pend_" + S.id; }
+function pendGet() { if (!S.id) return null; const p = store(pendKey()); return p && Object.keys(p).some(function (k) { return /^s\d$/.test(k); }) ? p : null; }
+function pendPut(sid, data) { const p = store(pendKey()) || {}; p[sid] = Object.assign(p[sid] || {}, data); p.at = Date.now(); store(pendKey(), p); }
+function pendDrop(sid) { const p = store(pendKey()); if (!p) return; delete p[sid]; store(pendKey(), Object.keys(p).some(function (k) { return /^s\d$/.test(k); }) ? p : null); }
+function scheduleRetry() { clearTimeout(S.retryT); S.retryT = setTimeout(flushPending, 30000); }
+async function flushPending() {
+  clearTimeout(S.retryT);
+  const p = pendGet();
+  if (!p || S.browse) return;
+  if (S.busy) return scheduleRetry();
+  S.busy = true;
+  let sent = 0;
+  try {
+    for (const sid of Object.keys(p).filter(function (k) { return /^s\d$/.test(k); })) {
+      const out = await api({ action: "save", id: S.id, name: S.name, pin: S.pin, stage: sid, data: p[sid] });
+      S.data[sid] = out.saved; pendDrop(sid); sent++;
+    }
+    toast("📶 보관해 두었던 내용을 선생님께 보냈어요.");
+  } catch (e) {
+    if (e.net) scheduleRetry(); else toast(e.message, true);
+  } finally { S.busy = false; if (sent || !pendGet()) { renderBar(); renderNav(); } }
+}
+window.addEventListener("online", function () { if (S.id && !S.browse) flushPending(); });
 function stageData(sid) {
   const o = {};
   fieldsOf(STAGES.find(function (s) { return s.id === sid; })).forEach(function (f) { if (S.data[f.key] != null) o[f.key] = S.data[f.key]; });
@@ -327,12 +399,24 @@ async function saveStage(quiet) {
   try {
     const st = STAGES.find(function (x) { return x.id === S.cur; });
     const before = stageStatus(S.data, st);
+    clearTimeout(S.autoT);
     const out = await api({ action: "save", id: S.id, name: S.name, pin: S.pin, stage: S.cur, data: stageData(S.cur) });
-    S.data[S.cur] = out.saved; S.dirty = false; store("eco_draft_" + S.id, null);
+    S.data[S.cur] = out.saved; S.dirty = false; S.autoAt = quiet === "auto"; store("eco_draft_" + S.id, null);
+    pendDrop(S.cur);
     if (before < 2 && stageStatus(S.data, st) === 2) celebrate(st);
     else if (!quiet) toast("💾 저장했어요.");
+    if (pendGet()) setTimeout(flushPending, 0);
     return true;
-  } catch (e) { toast(e.message, true); return false; }
+  } catch (e) {
+    if (e.net) {
+      /* 연결이 끊겼으면 이 기기에 보관하고, 연결되면 저절로 보낸다. 다음 단계로 넘어가도 된다 */
+      pendPut(S.cur, stageData(S.cur)); S.dirty = false; store("eco_draft_" + S.id, null);
+      if (quiet !== "auto") toast("📶 인터넷이 끊겨 이 기기에 보관했어요. 연결되면 자동으로 보내요. 창을 닫지 말아 주세요.", true);
+      scheduleRetry();
+      return true;
+    }
+    toast(e.message, true); return false;
+  }
   finally { S.busy = false; renderBar(); renderNav(); }
 }
 function doneCount() { return STAGES.filter(function (st) { return stageStatus(S.data, st) === 2; }).length; }
@@ -395,7 +479,11 @@ function renderBar() {
     return;
   }
   put(bar, h("div", { class: "bar-in" },
-    h("span", { id: "savestate", class: "state" + (S.dirty ? " dirty" : saved ? " ok" : ""), text: S.dirty ? "✋ 저장 안 됨" : (saved ? "✅ 저장됨 · " + saved : "아직 저장 전") }),
+    (function () {
+      const pend = pendGet() && pendGet()[S.cur];
+      const txt = pend ? "📶 기기에 보관 중 · 연결되면 자동 전송" : S.dirty ? "✋ 저장 안 됨 · 1분 뒤 자동 저장" : saved ? (S.autoAt ? "✅ 자동 저장됨 · " : "✅ 저장됨 · ") + saved : "아직 저장 전";
+      return h("span", { id: "savestate", class: "state" + (pend || S.dirty ? " dirty" : saved ? " ok" : ""), role: "status", text: txt });
+    })(),
     i < STAGES.length - 1 ? h("button", { class: "btn ghost", type: "button", text: "다음 " + LOOK[STAGES[i + 1].id], onclick: function () { goStage(STAGES[i + 1].id); } }) : null,
     h("button", { id: "savebtn", class: "btn", type: "button", text: "💾 저장하기", onclick: function () { saveStage(false); } })));
 }
@@ -445,7 +533,7 @@ function topicCard(t) {
     toast("✅ 주제와 질문을 넣었어요. 내 상황에 맞게 고쳐 써도 좋아요.");
   };
   return h("article", { class: "tcard" + (on ? " on" : "") },
-    h("h5", null, h("span", { class: "em", "aria-hidden": "true", text: t.em }), t.title, on ? h("span", { class: "picked", text: "✓ 고름" }) : null),
+    h("h4", null, h("span", { class: "em", "aria-hidden": "true", text: t.em }), t.title, on ? h("span", { class: "picked", text: "✓ 고름" }) : null),
     h("p", { class: "tm" }, t.m.map(function (m) { return h("span", { text: m }); })),
     h("div", { class: "tq basic" }, h("b", { text: "🌱 기본" }), h("p", { text: t.basic })),
     h("div", { class: "tq deep" }, h("b", { text: "🌳 심화" }), h("p", { text: t.deep })),
@@ -460,7 +548,7 @@ function topicsBox() {
   const draw = function () {
     const tab = TT.tab >= 0 ? TT.tab : Math.max(0, TRACKS.indexOf(S.data.track));
     put(box,
-      h("h4", null, h("i", { class: "ico", "aria-hidden": "true", text: "🌿" }), "주제 고르기", h("small", { text: "계열을 눌러 바꿔 봐요 · 다른 계열 주제도 골라도 돼요" })),
+      h("h3", null, h("i", { class: "ico", "aria-hidden": "true", text: "🌿" }), "주제 고르기", h("small", { text: "계열을 눌러 바꿔 봐요 · 다른 계열 주제도 골라도 돼요" })),
       h("div", { class: "ttabs", role: "tablist" }, TRACKS.map(function (tr, i) {
         const n = TOPICS.filter(function (t) { return t.tr === i; }).length;
         return h("button", { type: "button", role: "tab", "aria-selected": i === tab ? "true" : "false", text: TRACK_EM[i] + " " + tr + " (" + n + ")", onclick: function () { TT.tab = i; draw(); } });
@@ -484,7 +572,7 @@ function peopleBox() {
     h("small", { class: "pnote", text: "이해를 돕기 위해 지어낸 친구들이고, 예시 속 자료 내용도 형식을 보여 주려고 만든 것이에요." }));
 }
 function linksBox(compact) {
-  const out = h("div", { class: "links" + (compact ? " compact" : "") }, h("h4", null, h("i", { class: "ico", "aria-hidden": "true", text: "🔗" }), compact ? "자료 찾는 곳 (새 창으로 열려요)" : "자료는 여기서 찾아요 (누르면 새 창으로 열려요)"));
+  const out = h("div", { class: "links" + (compact ? " compact" : "") }, h("h3", null, h("i", { class: "ico", "aria-hidden": "true", text: "🔗" }), compact ? "자료 찾는 곳 (새 창으로 열려요)" : "자료는 여기서 찾아요 (누르면 새 창으로 열려요)"));
   Object.keys(LINKS).forEach(function (sec) {
     out.append(h("div", { class: "lsec" }, h("p", { class: "lhead", text: sec }),
       h("ul", null, LINKS[sec].map(function (x) {
@@ -530,24 +618,32 @@ function collegeBox(open) {
 }
 function linkHead() {
   return h("div", { class: "linkhead" },
-    h("h4", null, h("i", { class: "ico", "aria-hidden": "true", text: "🔗" }), "이전 활동과 이어 보기", h("span", { class: "req lk", text: "선택 · 강력 추천" })),
+    h("h3", null, h("i", { class: "ico", "aria-hidden": "true", text: "🔗" }), "이전 활동과 이어 보기", h("span", { class: "req lk", text: "선택 · 강력 추천" })),
     h("p", { text: "대학은 활동 하나보다 관심이 이어지는 흐름을 봐요. 예전 수업, 특강, 동아리, 독서에서 생긴 궁금증을 이번 탐구로 풀었다면 꼭 적어 두세요. 다른 과목에서 배운 개념과 이어 설명하면 더 좋아요." }),
     h("div", { class: "lkex" },
       h("p", null, h("b", { text: "이렇게 이어져요 " }), "~에 관심이 있어서 ~ 특강을 들었는데, 해결되지 않았던 궁금증을 이번에 알아보았다."),
       h("p", null, h("b", { text: "이렇게도 이어져요 " }), "○○ 과목 시간에 조사했던 ○○ 문제를 다른 과목의 ○○ 개념과 연결해 탐구해 보았다.")));
 }
+/* 선택·도전 칸은 접어 두고, 이미 쓴 내용이 있으면 펼친다. 인쇄할 때는 모두 펼친다 */
+function foldBox(title, inner, open) {
+  return h("details", { class: "fold", open: open || null },
+    h("summary", null, h("span", { class: "ft", text: "🚀 " + title }), h("span", { class: "fs", text: open ? "쓴 내용 있음" : "선택 · 눌러서 펼치기" })), inner);
+}
 function blockEl(b) {
-  if (b.t === "guide") return h("div", { class: "note" }, h("h4", null, h("i", { class: "ico", "aria-hidden": "true", text: b.title === "가이드" ? "🧭" : "📌" }), b.title), h("ul", null, b.items.map(function (x) { return h("li", { text: x }); })));
-  if (b.t === "ex") return h("div", { class: "ex" }, h("h4", null, h("i", { class: "ico", "aria-hidden": "true", text: "👀" }), b.title), b.lines.map(function (l) { return h("p", null, l[0] ? h("b", { text: l[0] + "  " }) : null, l[1]); }));
+  if (b.t === "guide") return h("div", { class: "note" }, h("h3", null, h("i", { class: "ico", "aria-hidden": "true", text: b.title === "가이드" ? "🧭" : "📌" }), b.title), h("ul", null, b.items.map(function (x) { return h("li", { text: x }); })));
+  if (b.t === "ex") return h("div", { class: "ex" }, h("h3", null, h("i", { class: "ico", "aria-hidden": "true", text: "👀" }), b.title), b.lines.map(function (l) { return h("p", null, l[0] ? h("b", { text: l[0] + "  " }) : null, l[1]); }));
   if (b.t === "warn") return h("div", { class: "warn" }, h("i", { class: "ico", "aria-hidden": "true", text: "🚫" }), b.text);
   if (b.t === "h") {
     const m = /^(.+?) · (.+)$/.exec(b.text);
     return h("h3", { class: "step" }, m ? [h("span", { class: "no", text: m[1] }), m[2]] : b.text, b.sub ? h("small", { text: b.sub }) : null);
   }
+  if (b.t === "f" && b.challenge) return foldBox("도전 칸 · " + b.label, fieldEl(b), filled(S.data[b.key]));
   if (b.t === "f") return fieldEl(b);
   if (b.t === "card") {
     const ic = /자료 카드/.test(b.title) ? "🗂️" : /기록/.test(b.title) ? "📓" : /평가/.test(b.title) ? "⭐" : "📝";
-    return h("div", { class: "card" }, h("h4", null, h("i", { class: "ico", "aria-hidden": "true", text: ic }), b.title), h("div", null, b.fields.map(fieldEl)));
+    const cardEl = h("div", { class: "card" }, h("h3", null, h("i", { class: "ico", "aria-hidden": "true", text: ic }), b.title), h("div", null, b.fields.map(fieldEl)));
+    if (/\(선택/.test(b.title)) return foldBox(b.title.replace(/\s*\(.*$/, "") + " (선택)", cardEl, b.fields.some(function (f) { return filled(S.data[f.key]); }));
+    return cardEl;
   }
   if (b.t === "ref") return refBlock();
   if (b.t === "people") return peopleBox();
@@ -568,6 +664,7 @@ function renderStudent() {
       S.browse ? h("span", { class: "who browse", text: "👀 둘러보기 중" }) : h("span", { class: "who", text: "🙂 " + S.id + " " + S.name }),
       h("button", { class: "btn ghost small", type: "button", text: "전체 보기·인쇄", onclick: async function () { if (S.dirty && !(await saveStage(true))) return; renderAll(); } }),
       S.browse ? h("button", { class: "btn ghost small", type: "button", text: "🏠 처음 화면으로", onclick: goHome }) : null,
+      S.browse ? null : h("button", { class: "btn small" + (S.initial ? "" : " ghost"), type: "button", text: "🔑 비밀번호 바꾸기", onclick: changePin }),
       h("button", { class: "btn ghost small", type: "button", text: S.browse ? "🔑 로그인" : "나가기", onclick: function () {
         if (S.browse) return goLogin();
         if (S.dirty && !confirm("저장하지 않은 내용은 지워집니다. 그래도 나갈까요?")) return;
@@ -654,15 +751,15 @@ function renderAll() {
   const rec = Object.assign({}, S.data, { id: S.id || "둘러보기", name: S.name || "" });
   renderPrint([rec], S.browse ? "둘러보기" : S.id + " " + S.name, renderStudent, false);
 }
-window.addEventListener("beforeunload", function (e) { if (S.dirty && !S.browse) { e.preventDefault(); e.returnValue = ""; } });
+window.addEventListener("beforeunload", function (e) { if ((S.dirty || pendGet()) && !S.browse) { e.preventDefault(); e.returnValue = ""; } });
 
 /* ============================================================
    교사 화면
    ============================================================ */
-const T = { pw: "", rows: [], cls: "", tab: "status", sel: "", idle: null, sample: 0 };
+const T = { pw: "", rows: [], cls: "", tab: "status", sel: "", idle: null, sample: 0, meta: {}, partial: false, all: false, todo: false, skew: 0 };
 /* 교사 화면을 30분 동안 쓰지 않으면 비밀번호를 지우고 로그인 화면으로 돌아간다 */
 function teacherLogout(msg) {
-  T.pw = ""; T.rows = []; T.sel = ""; clearTimeout(T.idle);
+  T.pw = ""; T.rows = []; T.sel = ""; T.meta = {}; T.partial = T.all = false; clearTimeout(T.idle);
   if (location.hash === "#teacher") renderTeacherLogin();
   if (msg) toast(msg);
 }
@@ -693,27 +790,59 @@ function renderTeacherLogin() {
     } }, h("label", { class: "fl", for: "tpw", text: "교사 비밀번호" }), pw, h("div", { style: "margin-top:16px" }, go)),
     h("p", { class: "hint", style: "margin-top:12px", text: "학생 앞에서 비밀번호를 입력하지 마세요. 30분 동안 쓰지 않으면 자동으로 로그아웃돼요." })));
 }
+/* 학생이 많으면(서버 기준 120명 초과) 반 단위로 불러온다 */
 async function loadRows() {
-  const out = await api({ action: "teacher_list", tpw: T.pw });
-  T.rows = out.rows.map(function (r) { const o = {}; for (const k in r) o[k] = r[k] == null ? "" : r[k]; o.id = String(o.id); return o; });
+  const req = { action: "teacher_list", tpw: T.pw };
+  if (T.partial && T.cls) req.cls = T.cls;
+  if (T.all) req.all = true;
+  let out = await api(req);
+  if (out.partial) {
+    T.partial = true;
+    const cs = Object.keys(out.classes || {}).sort();
+    if (!T.cls || cs.indexOf(T.cls) < 0) T.cls = cs[0] || "";
+    if (T.cls) out = await api({ action: "teacher_list", tpw: T.pw, cls: T.cls });
+  }
+  T.meta = out;
+  T.skew = out.now ? out.now - Date.now() : 0;
+  T.rows = (out.rows || []).map(function (r) { const o = {}; for (const k in r) o[k] = r[k] == null ? "" : r[k]; o.id = String(o.id); return o; });
 }
-function shownRows() { return T.rows.filter(function (r) { return !T.cls || clsOf(r.id) === T.cls; }); }
+function classList() {
+  const m = T.meta.classes || {};
+  T.rows.forEach(function (r) { const c = clsOf(r.id); if (!(c in m)) m[c] = 0; });
+  return Object.keys(m).sort().map(function (c) { return [c, m[c] || T.rows.filter(function (r) { return clsOf(r.id) === c; }).length]; });
+}
+/* 저장했는데 선생님 확인을 아직 안 한 단계가 있는 학생 */
+function needsCheck(r) { return STAGES.some(function (st) { return st.check && filled(r[st.id]) && !filled(r["t_c" + st.check]); }); }
+function isLocked(r) {
+  const mf = T.meta.maxFails || 10, lm = T.meta.lockMinutes || 5;
+  return Number(r.fails) >= mf && (Date.now() + T.skew - Number(r.lockt)) < lm * 60000;
+}
+function shownRows() { return T.rows.filter(function (r) { return (!T.cls || clsOf(r.id) === T.cls) && (!T.todo || T.tab !== "status" || needsCheck(r)); }); }
 function renderTeacher() {
   document.body.classList.remove("has-bar");
   $app.className = "wrap wide";
-  const classes = Array.from(new Set(T.rows.map(function (r) { return clsOf(r.id); }))).sort();
-  if (T.cls && classes.indexOf(T.cls) < 0) T.cls = "";
-  const sel = h("select", { "aria-label": "반 고르기", onchange: function () { T.cls = sel.value; T.sel = ""; renderTeacher(); } },
-    h("option", { value: "", text: "전체 (" + T.rows.length + "명)" }),
-    classes.map(function (c) { return h("option", { value: c, text: clsName(c) }); }));
+  const classes = classList();
+  if (T.cls && !classes.some(function (c) { return c[0] === T.cls; })) T.cls = "";
+  const total = T.meta.total != null ? T.meta.total : T.rows.length;
+  const sel = h("select", { "aria-label": "반 고르기", onchange: async function () {
+    const v = sel.value;
+    if (T.partial && !v && !confirm("학생이 " + total + "명이라 전체를 불러오면 느릴 수 있어요. 불러올까요?")) { sel.value = T.cls; return; }
+    T.cls = v; T.sel = ""; T.all = T.partial && !v;
+    if (T.partial) { sel.disabled = true; try { await loadRows(); } catch (e) { toast(e.message, true); } }
+    renderTeacher();
+  } },
+    h("option", { value: "", text: "전체 (" + total + "명)" + (T.partial ? " · 느릴 수 있음" : "") }),
+    classes.map(function (c) { return h("option", { value: c[0], text: clsName(c[0]) + " (" + c[1] + "명)" }); }));
   sel.value = T.cls;
+  const todo = h("label", { class: "todo" }, h("input", { type: "checkbox", checked: T.todo || null, onchange: function (e) { T.todo = e.target.checked; T.sel = ""; renderTeacher(); } }), " 확인 안 한 학생만");
   const tabBtn = function (id, label) { return h("button", { type: "button", role: "tab", "aria-selected": T.tab === id ? "true" : "false", text: label, onclick: function () { T.tab = id; renderTeacher(); } }); };
   put($app, 
     h("div", { class: "top" }, h("h1", { text: CLUB.short + " · 선생님용" }),
       h("button", { class: "btn ghost small", type: "button", text: "로그아웃", onclick: function () { teacherLogout("로그아웃했어요."); } }),
       h("button", { class: "btn ghost small", type: "button", text: "새로 고침", onclick: async function () { try { await loadRows(); renderTeacher(); toast("새로 불러왔습니다."); } catch (e) { toast(e.message, true); } } })),
     DEMO ? h("div", { class: "demo" }, h("b", { text: "미리보기 모드 " }), "이 기기에 저장된 연습 자료입니다.") : null,
-    h("div", { class: "tools" }, (T.tab === "sample" || T.tab === "admin") ? null : sel,
+    !DEMO && T.meta.roster === 0 ? h("div", { class: "warnbox", role: "alert" }, h("b", { text: "⚠️ '명단' 시트가 비어 있어요. " }), "지금은 학번과 이름만 알면 누구나 가입할 수 있어요. 구글 시트의 '명단' 시트에 학생 학번·이름을 넣어 두면 명단에 있는 학생만 들어올 수 있어요.") : null,
+    h("div", { class: "tools" }, (T.tab === "sample" || T.tab === "admin") ? null : sel, T.tab === "status" ? todo : null,
       h("div", { class: "tabs", role: "tablist" }, tabBtn("status", "제출 현황·확인"), tabBtn("summary", "학생부 작성용 요약"), tabBtn("sample", "📚 완성 예시"), tabBtn("admin", "⚙️ 관리")),
       (T.tab === "status" || T.tab === "summary") && shownRows().length ? h("button", { class: "btn ghost small", type: "button", text: "🖨️ 보이는 학생 모두 인쇄 (" + shownRows().length + "명)", onclick: function () {
         const rs = shownRows(); renderPrint(rs, (T.cls ? clsName(T.cls) : "전체") + " " + rs.length + "명", renderTeacher, true);
@@ -722,12 +851,13 @@ function renderTeacher() {
 }
 function statusTab() {
   const rows = shownRows();
-  if (!rows.length) return h("div", { class: "panel", text: "아직 접속한 학생이 없습니다." });
+  if (!rows.length) return h("div", { class: "panel", text: T.todo ? "확인할 학생이 없어요. 👍" : "아직 접속한 학생이 없습니다." });
+  const locked = rows.filter(isLocked);
   const tb = h("tbody");
   rows.forEach(function (r) {
     const tr = h("tr", { class: "row" + (r.id === T.sel ? " sel" : ""), tabindex: "0", onclick: function () { T.sel = r.id; renderTeacher(); const d = document.getElementById("detail"); if (d) d.scrollIntoView({ behavior: "smooth", block: "start" }); },
       onkeydown: function (e) { if (e.key === "Enter") tr.click(); } },
-      h("td", { class: "l", text: r.id }), h("td", { class: "l", text: r.name }),
+      h("td", { class: "l", text: r.id }), h("td", { class: "l" }, r.name, isLocked(r) ? h("span", { class: "lockb", title: "비밀번호를 여러 번 틀려 잠김", text: "🔒 잠김" }) : null),
       STAGES.map(function (st) { const s = stageStatus(r, st); return h("td", { class: "s" + s, title: STATUS[s][1], text: STATUS[s][0] + " " + STATUS[s][1] }); }),
       [1, 2, 3].map(function (n) { return h("td", { class: filled(r["t_c" + n]) ? "s2" : "s0", text: filled(r["t_c" + n]) ? "확인" : "—" }); }),
       h("td", { class: "q", text: filled(r.question) ? String(r.question) : "" }));
@@ -735,6 +865,8 @@ function statusTab() {
   });
   const done = STAGES.map(function (st) { return rows.filter(function (r) { return stageStatus(r, st) === 2; }).length; });
   const out = h("div", null,
+    locked.length ? h("div", { class: "warnbox", role: "status" }, h("b", { text: "🔒 잠긴 학생 " + locked.length + "명 (" + locked.map(function (r) { return r.name; }).join(", ") + ") " }),
+      (T.meta.lockMinutes || 5) + "분 뒤 저절로 풀려요. 바로 풀려면 학생 줄을 눌러 '학생 비밀번호 초기화'를 누르세요.") : null,
     h("div", { class: "panel" },
       h("div", { class: "tblwrap" }, h("table", { class: "st" },
         h("thead", null, h("tr", null, h("th", { class: "l", text: "학번" }), h("th", { class: "l", text: "이름" }),
@@ -783,8 +915,8 @@ function detailPanel(r) {
     catch (e) { toast(e.message, true); save.disabled = false; }
   } });
   const reset = h("button", { class: "btn danger small", type: "button", text: "학생 비밀번호 초기화", onclick: async function () {
-    if (!confirm(r.name + " 학생의 비밀번호를 초기화할까요? 학생이 다음에 들어올 때 새 비밀번호를 정합니다. 보고서 내용은 그대로입니다.")) return;
-    try { await api({ action: "teacher_reset", tpw: T.pw, id: r.id }); toast("초기화했습니다. 학생에게 새 비밀번호로 들어오라고 알려 주세요."); }
+    if (!confirm(r.name + " 학생의 비밀번호를 초기화할까요? 명단에 생년월일이 있으면 생년월일(월일 4자리)로 다시 들어오고, 없으면 학생이 다음에 들어올 때 새 비밀번호를 정합니다. 보고서 내용은 그대로입니다.")) return;
+    try { await api({ action: "teacher_reset", tpw: T.pw, id: r.id }); toast("초기화했습니다. 학생에게 생년월일 4자리(명단에 있으면)로 들어와 비밀번호를 바꾸라고 알려 주세요."); }
     catch (e) { toast(e.message, true); }
   } });
   return h("div", { class: "panel", id: "detail" },
@@ -853,7 +985,7 @@ function adminTab() {
   } });
   const clsSel = h("select", { "aria-label": "반 고르기", onchange: function () { T.cls = clsSel.value; renderTeacher(); } },
     h("option", { value: "", text: "반 고르기" }),
-    Array.from(new Set(T.rows.map(function (r) { return clsOf(r.id); }))).sort().map(function (c) { return h("option", { value: c, text: clsName(c) }); }));
+    classList().map(function (c) { return h("option", { value: c[0], text: clsName(c[0]) + " (" + c[1] + "명)" }); }));
   clsSel.value = T.cls;
   return h("div", { class: "admin" },
     h("section", { class: "panel" }, h("h2", { text: "💾 백업" }),
@@ -868,9 +1000,9 @@ function adminTab() {
       h("ul", { class: "checklist" },
         h("li", { text: "교사 비밀번호는 Apps Script '스크립트 속성'의 TEACHER_PASSWORD에 10자 이상으로 둡니다. 코드에는 쓰지 않습니다." }),
         h("li", { text: "구글 시트는 다른 사람과 공유하지 않습니다. 웹 앱만 '모든 사용자'로 엽니다." }),
-        h("li", { text: "'명단' 시트에 학번과 이름을 넣어 두면 명단에 있는 학생만 들어올 수 있습니다." }),
-        h("li", { text: "학생이 비밀번호를 10번 틀리면 15분 동안 잠기고, 학생 줄의 '학생 비밀번호 초기화'로 바로 풀 수 있습니다." }),
-        h("li", { text: "교사 비밀번호를 10분 안에 8번 틀리면 10분 동안 교사 화면이 막힙니다." }),
+        h("li", { text: "'명단' 시트에 학번(A)·이름(B)·생년월일 월일 4자리(C)를 넣어 두면 명단에 있는 학생만, 생년월일을 처음 비밀번호로 들어올 수 있습니다. 310처럼 3자리로 바뀌어도 0310으로 맞춰 봅니다." }),
+        h("li", { text: "학생이 비밀번호를 10번 틀리면 " + (T.meta.lockMinutes || 5) + "분 동안 잠기고(현황표에 🔒 표시), 학생 줄의 '학생 비밀번호 초기화'로 바로 풀 수 있습니다." }),
+        h("li", { text: "교사 비밀번호를 10분 안에 8번 틀리면 10분 동안 교사 화면이 막힙니다. 누가 일부러 막아도 들어올 수 있게 스크립트 속성에 보조 비밀번호 TEACHER_PASSWORD2(10자 이상)를 따로 넣어 두세요." }),
         h("li", { text: "선생님 화면은 30분 동안 쓰지 않으면 저절로 로그아웃됩니다. 공용 컴퓨터에서는 다 쓰고 '로그아웃'을 누르세요." })),
       h("button", { class: "btn ghost small", type: "button", text: "로그아웃", onclick: function () { teacherLogout("로그아웃했어요."); } })));
 }
