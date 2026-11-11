@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="생태 탐구">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#84cc16"/>
+      <stop offset="1" stop-color="#3f6212"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#g)"/>
+  <!-- 잎 -->
+  <path d="M10 50 C 8 28, 24 10, 50 9 C 52 34, 36 52, 10 50 Z" fill="#ffffff"/>
+  <path d="M12 48 C 22 38, 32 28, 44 16" fill="none" stroke="#65a30d" stroke-width="3.4" stroke-linecap="round"/>
+  <path d="M22 38 L19 28 M29 31 L27 21 M27 34 L37 35 M34 26 L43 27" fill="none" stroke="#65a30d" stroke-width="2.4" stroke-linecap="round"/>
+  <!-- 돋보기 -->
+  <circle cx="44" cy="42" r="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="4"/>
+  <path d="M50.5 48.5 L57 55" stroke="#0f766e" stroke-width="5.4" stroke-linecap="round"/>
+</svg>
