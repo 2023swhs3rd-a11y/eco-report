@@ -356,6 +356,18 @@ function jumpTo(k) {
   const inp = el.querySelector("textarea, input, .seg button");
   if (inp) inp.focus({ preventScroll: true });
 }
+/* 단계 맨 아래: 저장하고 다음 단계로 (마지막 단계는 저장하고 전체 보기) */
+function stageEnd(st) {
+  const i = STAGES.indexOf(st), next = STAGES[i + 1];
+  return h("div", { class: "stage-end noprint" },
+    h("p", { text: next ? "여기까지 썼으면 저장하고 다음 단계로 가요. 다 못 썼어도 괜찮아요. 나중에 돌아와서 이어 쓸 수 있어요." : "마지막 단계예요. 저장하고 내 보고서 전체를 확인해요." }),
+    h("button", { class: "btn big", type: "button",
+      text: next ? "💾 저장하고 다음으로 넘어가기 → " + next.badge + " " + next.nick : "💾 저장하고 내 보고서 전체 보기",
+      onclick: async function () {
+        if (next) { await goStage(next.id); return; }
+        if (await saveStage(false)) renderAll();
+      } }));
+}
 function nextReq() {
   const st = STAGES.find(function (s) { return s.id === S.cur; });
   const left = reqItems(st).filter(function (x) { return !filled(S.data[x[0]]); });
@@ -622,7 +634,7 @@ const BLOOM = [
 ];
 function bloomBox() {
   return h("details", { class: "bloom" },
-    h("summary", null, h("i", { class: "ico", "aria-hidden": "true", text: "🔭" }), "질문 수준 올려 보기 · 블룸의 6단계"),
+    h("summary", null, h("i", { class: "ico", "aria-hidden": "true", text: "🔭" }), "질문 수준 올려 보기 · 블룸의 6단계", h("span", { class: "more", "aria-hidden": "true" })),
     h("p", { text: "같은 주제라도 질문을 어떻게 묻느냐에 따라 탐구의 깊이가 달라져요. 🌱 기본은 2~3단계, 🌳 심화는 4~5단계 질문이 알맞아요. 1단계 질문은 검색 한 번이면 끝나서 탐구가 짧아지고, 6단계는 다음 탐구에서 도전해 봐요." }),
     h("ol", { class: "blist" }, BLOOM.map(function (x) {
       return h("li", { class: /추천/.test(x[3]) ? "rec" : "" }, h("b", { text: x[0] }), h("span", { class: "bd", text: x[1] }), h("span", { class: "bq", text: "🐦 " + x[2] }), h("em", { text: x[3] }));
@@ -632,7 +644,7 @@ function bloomBox() {
 }
 function collegeBox(open) {
   return h("details", { class: "college", open: open ? true : null },
-    h("summary", null, h("i", { class: "ico", "aria-hidden": "true", text: "🎓" }), "이 탐구, 대학은 어떻게 볼까요? (학생부종합전형)"),
+    h("summary", null, h("i", { class: "ico", "aria-hidden": "true", text: "🎓" }), "이 탐구, 대학은 어떻게 볼까요? (학생부종합전형)", h("span", { class: "more", "aria-hidden": "true" })),
     h("p", { text: "학생부종합전형에서 대학은 학교생활기록부를 읽고 크게 세 가지 역량을 살펴요. 여러 대학의 학생부종합전형 가이드북이 이 세 가지 틀로 평가 방법을 설명해요." }),
     h("div", { class: "cgrid" },
       h("div", null, h("b", { text: "📘 학업역량" }), h("p", { text: "배운 것을 스스로 더 알아보려는 태도와 탐구력" }), h("p", { class: "here", text: "이 탐구에서는 → 질문을 세우고, 자료·관찰·실험으로 근거를 모아 결론을 내는 과정" })),
@@ -722,7 +734,8 @@ function renderStudent() {
         let n = 0;
         while (n < st.blocks.length && ((st.blocks[n].t === "guide" && st.blocks[n].title === "가이드") || st.blocks[n].t === "people")) n++;
         return [levelsBox(st), teacherNote(st), moreInfo(st, st.blocks.slice(0, n))].concat(st.blocks.slice(n).map(blockEl));
-      })()),
+      })(),
+      S.browse ? null : stageEnd(st)),
     h("div", { id: "bar", class: "bar noprint" }));
   renderNav(); renderBar(); updReq();
 }
